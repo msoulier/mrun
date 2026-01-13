@@ -1,0 +1,3 @@
+#!/bin/sh
+
+./mrun -debug -producer ./producer.sh -consumer ./consumer.sh 
