@@ -10,15 +10,27 @@ import (
 	"github.com/op/go-logging"
 )
 
+type Policy int64
+
+const (
+	Restart Policy = iota
+	NoRestart
+)
+
 var (
 	log	*logging.Logger = nil
 	debug bool = false
 	producer string = ""
 	consumer string = ""
+	policy Policy = Restart
+	norestart bool = false
+	// number of retry attempts?
+	// rate limiting?
 )
 
 func init() {
 	flag.BoolVar(&debug, "debug", false, "Debug logging")
+	flag.BoolVar(&norestart, "norestart", false, "Do not restart a failed process, just quit")
 	flag.StringVar(&producer, "producer", "", "Path to producer run script")
 	flag.StringVar(&consumer, "consumer", "", "Path to consumer run script")
 	flag.Parse()
@@ -54,9 +66,113 @@ func init() {
 		}
 		log.Debugf("abs consumer: %s", consumer)
 	}
+
+	if norestart {
+		policy = NoRestart
+	}
+}
+
+func watch_producer(pipefds [2]int, comms chan string) {
+	log.Debug("starting watch_producer")
+	readfd := pipefds[0]
+	writefd := pipefds[1]
+	for {
+		// Fork first process (writer - closes read end)
+		pid1, _, errno := syscall.RawSyscall(syscall.SYS_FORK, 0, 0, 0)
+		if errno != 0 {
+			log.Errorf("Failed to fork first process: %v", errno)
+			os.Exit(1)
+		}
+
+		if pid1 == 0 {
+			log.Debug("in first child")
+			// Child 1: writer process
+			// Close read end
+			syscall.Close(readfd)
+
+			// Set write end to non-blocking
+			flags, _ := unix.FcntlInt(uintptr(writefd), syscall.F_GETFL, 0)
+			unix.FcntlInt(uintptr(writefd), syscall.F_SETFL, flags|syscall.O_NONBLOCK)
+
+			// Redirect stdout to pipe write end
+			syscall.Dup2(writefd, syscall.Stdout)
+			syscall.Close(writefd)
+
+			// Exec into program (generates data)
+			//err := syscall.Exec("/bin/sh", []string{"sh", "-c", "echo 'Hello from writer'; seq 1 10"}, os.Environ())
+			log.Debugf("calling exec on %s", producer)
+			pname := filepath.Base(producer)
+			err := syscall.Exec(producer, []string{pname}, os.Environ())
+			if err != nil {
+				log.Errorf("Exec producer failed: %v", err)
+				os.Exit(1)
+			}
+		}
+		comms <- "producer ready"
+		go watch_consumer(pipefds, comms)
+
+		var status syscall.WaitStatus
+		syscall.Wait4(int(pid1), &status, 0, nil)
+		log.Infof("Writer process (PID %d) exited with status %d", pid1, status.ExitStatus())
+
+		if policy != Restart {
+			comms <- "producer exit"
+			return
+		}
+	}
+}
+
+func watch_consumer(pipefds [2]int, comms chan string) {
+	log.Debug("starting watch_consumer")
+	readfd := pipefds[0]
+	writefd := pipefds[1]
+	for {
+		// Fork second process (reader - closes write end)
+		pid2, _, errno := syscall.RawSyscall(syscall.SYS_FORK, 0, 0, 0)
+		if errno != 0 {
+			log.Errorf("Failed to fork second process: %v", errno)
+			os.Exit(1)
+		}
+
+		if pid2 == 0 {
+			log.Debug("in second child")
+			// Child 2: reader process
+			// Close write end
+			syscall.Close(writefd)
+
+			// Set read end to non-blocking
+			flags, _ := unix.FcntlInt(uintptr(readfd), syscall.F_GETFL, 0)
+			unix.FcntlInt(uintptr(readfd), syscall.F_SETFL, flags|syscall.O_NONBLOCK)
+
+			// Redirect stdin from pipe read end
+			syscall.Dup2(readfd, syscall.Stdin)
+			syscall.Close(readfd)
+
+			// Exec into program (reads data)
+			log.Debugf("calling exec on %s", consumer)
+			cname := filepath.Base(consumer)
+			err := syscall.Exec(consumer, []string{cname}, os.Environ())
+			if err != nil {
+				log.Errorf("Exec consumer failed: %v", err)
+				os.Exit(1)
+			}
+		}
+		comms <- "consumer ready"
+
+		var status syscall.WaitStatus
+		syscall.Wait4(int(pid2), &status, 0, nil)
+		log.Infof("Reader process (PID %d) exited with status %d", pid2, status.ExitStatus())
+
+		if policy != Restart {
+			comms <- "consumer exit"
+			return
+		}
+	}
 }
 
 func main() {
+	comms := make(chan string)
+	first := true
 	// Create pipe
 	pipefds := [2]int{}
 	err := syscall.Pipe(pipefds[:])
@@ -70,78 +186,22 @@ func main() {
 
 	log.Debugf("Created pipe: read=%d, write=%d", readfd, writefd)
 
-	// Fork first process (writer - closes read end)
-	pid1, _, errno := syscall.RawSyscall(syscall.SYS_FORK, 0, 0, 0)
-	if errno != 0 {
-		log.Errorf("Failed to fork first process: %v", err)
-		os.Exit(1)
-	}
+	go watch_producer(pipefds, comms)
 
-	if pid1 == 0 {
-		log.Debug("in first child")
-		// Child 1: writer process
-		// Close read end
-		syscall.Close(readfd)
+	for {
+		log.Debug("main: top of for loop")
+		// producer ready
+		status := <- comms
+		log.Debugf("main: %s", status)
+		// consumer ready
+		status = <- comms
+		log.Debugf("main: %s", status)
 
-		// Set write end to non-blocking
-		flags, _ := unix.FcntlInt(uintptr(writefd), syscall.F_GETFL, 0)
-		unix.FcntlInt(uintptr(writefd), syscall.F_SETFL, flags|syscall.O_NONBLOCK)
-
-		// Redirect stdout to pipe write end
-		syscall.Dup2(writefd, syscall.Stdout)
-		syscall.Close(writefd)
-
-		// Exec into program (generates data)
-		//err := syscall.Exec("/bin/sh", []string{"sh", "-c", "echo 'Hello from writer'; seq 1 10"}, os.Environ())
-		log.Debugf("calling exec on %s", producer)
-		pname := filepath.Base(producer)
-		err := syscall.Exec(producer, []string{pname}, os.Environ())
-		if err != nil {
-			log.Errorf("Exec producer failed: %v", err)
-			os.Exit(1)
+		if first {
+			// Parent: close both ends
+			syscall.Close(readfd)
+			syscall.Close(writefd)
+			first = false
 		}
 	}
-
-	// Fork second process (reader - closes write end)
-	pid2, _, errno := syscall.RawSyscall(syscall.SYS_FORK, 0, 0, 0)
-	if errno != 0 {
-		log.Errorf("Failed to fork second process: %v", err)
-		os.Exit(1)
-	}
-
-	if pid2 == 0 {
-		log.Debug("in second child")
-		// Child 2: reader process
-		// Close write end
-		syscall.Close(writefd)
-
-		// Set read end to non-blocking
-		flags, _ := unix.FcntlInt(uintptr(readfd), syscall.F_GETFL, 0)
-		unix.FcntlInt(uintptr(readfd), syscall.F_SETFL, flags|syscall.O_NONBLOCK)
-
-		// Redirect stdin from pipe read end
-		syscall.Dup2(readfd, syscall.Stdin)
-		syscall.Close(readfd)
-
-		// Exec into program (reads data)
-		log.Debugf("calling exec on %s", consumer)
-		cname := filepath.Base(consumer)
-		err := syscall.Exec(consumer, []string{cname}, os.Environ())
-		if err != nil {
-			log.Errorf("Exec consumer failed: %v", err)
-			os.Exit(1)
-		}
-	}
-
-	// Parent: close both ends
-	syscall.Close(readfd)
-	syscall.Close(writefd)
-
-	// Wait for both children
-	var status syscall.WaitStatus
-	syscall.Wait4(int(pid1), &status, 0, nil)
-	log.Infof("Writer process (PID %d) exited with status %d", pid1, status.ExitStatus())
-
-	syscall.Wait4(int(pid2), &status, 0, nil)
-	log.Infof("Reader process (PID %d) exited with status %d", pid2, status.ExitStatus())
 }
