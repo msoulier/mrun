@@ -5,6 +5,7 @@ import (
 	"syscall"
 	"path/filepath"
 	"flag"
+	"os/signal"
 
 	"golang.org/x/sys/unix"
 	"github.com/op/go-logging"
@@ -24,6 +25,7 @@ var (
 	consumer string = ""
 	policy Policy = Restart
 	norestart bool = false
+	shutdown_asap bool = false
 	// number of retry attempts?
 	// rate limiting?
 )
@@ -72,7 +74,7 @@ func init() {
 	}
 }
 
-func watch_producer(pipefds [2]int, comms chan string) {
+func watch_producer(pipefds [2]int, comms chan uintptr) {
 	log.Debug("starting watch_producer")
 	readfd := pipefds[0]
 	writefd := pipefds[1]
@@ -108,21 +110,19 @@ func watch_producer(pipefds [2]int, comms chan string) {
 				os.Exit(1)
 			}
 		}
-		comms <- "producer ready"
+		comms <- pid1
 		go watch_consumer(pipefds, comms)
 
 		var status syscall.WaitStatus
 		syscall.Wait4(int(pid1), &status, 0, nil)
 		log.Infof("Writer process (PID %d) exited with status %d", pid1, status.ExitStatus())
 
-		if policy != Restart {
-			comms <- "producer exit"
-			return
-		}
+		comms <- 0
+		return
 	}
 }
 
-func watch_consumer(pipefds [2]int, comms chan string) {
+func watch_consumer(pipefds [2]int, comms chan uintptr) {
 	log.Debug("starting watch_consumer")
 	readfd := pipefds[0]
 	writefd := pipefds[1]
@@ -157,51 +157,81 @@ func watch_consumer(pipefds [2]int, comms chan string) {
 				os.Exit(1)
 			}
 		}
-		comms <- "consumer ready"
+		comms <- pid2
 
 		var status syscall.WaitStatus
 		syscall.Wait4(int(pid2), &status, 0, nil)
 		log.Infof("Reader process (PID %d) exited with status %d", pid2, status.ExitStatus())
 
-		if policy != Restart {
-			comms <- "consumer exit"
-			return
-		}
+		comms <- 0
+		return
 	}
 }
 
 func main() {
-	comms := make(chan string)
-	first := true
-	// Create pipe
-	pipefds := [2]int{}
-	err := syscall.Pipe(pipefds[:])
-	if err != nil {
-		log.Errorf("Failed to create pipe: %v", err)
-		os.Exit(1)
-	}
+	sigs := make(chan os.Signal, 1)
 
-	readfd := pipefds[0]
-	writefd := pipefds[1]
+	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Debugf("Created pipe: read=%d, write=%d", readfd, writefd)
-
-	go watch_producer(pipefds, comms)
+	// Start signal handler
+	go func() {
+		sig := <-sigs
+		switch sig {
+		case syscall.SIGHUP:
+			log.Warning("SIGHUP")
+			shutdown_asap = true
+		case syscall.SIGINT:
+			log.Warning("SIGINT")
+			shutdown_asap = true
+		case syscall.SIGTERM:
+			log.Warning("SIGTERM")
+			shutdown_asap = true
+		default:
+			log.Debug("unknown signal")
+		}
+	}()
 
 	for {
+		if shutdown_asap {
+			break
+		}
+		comms := make(chan uintptr)
+		// Create pipe
+		pipefds := [2]int{}
+		err := syscall.Pipe(pipefds[:])
+		if err != nil {
+			log.Errorf("Failed to create pipe: %v", err)
+			os.Exit(1)
+		}
+
+		readfd := pipefds[0]
+		writefd := pipefds[1]
+
+		log.Debugf("Created pipe: read=%d, write=%d", readfd, writefd)
+
+		go watch_producer(pipefds, comms)
+
 		log.Debug("main: top of for loop")
 		// producer ready
-		status := <- comms
-		log.Debugf("main: %s", status)
+		pid1 := <- comms
+		log.Debugf("pid1: %d", pid1)
 		// consumer ready
-		status = <- comms
-		log.Debugf("main: %s", status)
+		pid2 := <- comms
+		log.Debugf("pid2: %d", pid2)
 
-		if first {
-			// Parent: close both ends
-			syscall.Close(readfd)
-			syscall.Close(writefd)
-			first = false
+		// Parent: close both ends, but not until both children
+		// have forked.
+		syscall.Close(readfd)
+		syscall.Close(writefd)
+
+		// Block on either goroutine quitting.
+		<-comms
+		log.Errorf("watch routine exited")
+		syscall.Kill(int(pid1), syscall.SIGTERM)
+		syscall.Kill(int(pid2), syscall.SIGTERM)
+
+		if policy != Restart {
+			os.Exit(1)
 		}
 	}
 }
